@@ -1,6 +1,8 @@
 use any_chain_eval::Chain;
 use futures_core::Stream;
 use futures_util::{StreamExt as _, TryStreamExt as _};
+use pallas::applying::utils::AccountState;
+use pallas::applying::Environment;
 use pallas::codec::minicbor::{self};
 use pallas::crypto::hash::Hash;
 use pallas::interop::utxorpc as interop;
@@ -11,7 +13,8 @@ use pallas::interop::utxorpc::spec::query::ReadParamsRequest;
 use pallas::interop::utxorpc::spec::submit::{WaitForTxResponse, *};
 use pallas::ledger::primitives::conway::{MintedTx, TransactionInput};
 use pallas::ledger::traverse::wellknown::GenesisValues;
-use std::collections::HashSet;
+use pallas::ledger::traverse::MultiEraUpdate;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,7 +22,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::ledger::TxoRef;
+use crate::ledger::pparams::Genesis;
+use crate::ledger::{pparams, EraCbor, PParamsBody, TxoRef};
 use crate::mempool::{Event, Mempool, UpdateFilter};
 use crate::serve::grpc::query::QueryServiceImpl;
 use crate::serve::GenesisFiles;
@@ -93,75 +97,79 @@ impl submit_service_server::SubmitService for SubmitServiceImpl {
         fn resolve_inputs(
             ledger: &LedgerStore,
             tx_cbor: &[u8],
-        ) -> Result<Vec<ResolvedInput>, Status> {
+        ) -> Result<HashMap<TxoRef, EraCbor>, Status> {
             let minted_tx: MintedTx = minicbor::decode(tx_cbor).unwrap();
             let ref_is_empty = minted_tx.transaction_body.reference_inputs.is_none();
-            if ref_is_empty {
-                return Ok(vec![]);
-            }
-            let input_refs: Vec<TxoRef> = minted_tx
+            let collat_is_empty = minted_tx.transaction_body.collateral.is_none();
+
+            let mut inputs: Vec<TxoRef> = minted_tx
                 .transaction_body
                 .inputs
                 .iter()
                 .map(|x| TxoRef(x.transaction_id, x.index.try_into().unwrap()))
-                .chain(
-                    minted_tx
-                        .transaction_body
-                        .reference_inputs
-                        .clone()
-                        .unwrap()
-                        .iter()
-                        .map(|x| TxoRef(x.transaction_id, x.index.try_into().unwrap())),
-                )
                 .collect();
 
+            if !collat_is_empty {
+                let collat_inputs: Vec<TxoRef> = minted_tx
+                    .transaction_body
+                    .collateral
+                    .clone()
+                    .unwrap()
+                    .iter()
+                    .map(|x| TxoRef(x.transaction_id, x.index.try_into().unwrap()))
+                    .collect();
+                inputs.extend(collat_inputs);
+            }
+
+            if !ref_is_empty {
+                let ref_inputs: Vec<TxoRef> = minted_tx
+                    .transaction_body
+                    .reference_inputs
+                    .clone()
+                    .unwrap()
+                    .iter()
+                    .map(|x| TxoRef(x.transaction_id, x.index.try_into().unwrap()))
+                    .collect();
+                inputs.extend(ref_inputs);
+            }
+
             let utxos = ledger
-                .get_utxos(input_refs)
+                .get_utxos(inputs)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-            let resolved_inputs = utxos
-                .into_iter()
-                .map(|(txo_ref, utxo_cbor)| {
-                    let output = minicbor::decode(&utxo_cbor.1)
-                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                    Ok(ResolvedInput {
-                        input: TransactionInput {
-                            transaction_id: txo_ref.0,
-                            index: txo_ref.1.into(),
-                        },
-                        output,
-                    })
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-
-            Ok(resolved_inputs)
+            Ok(utxos)
         }
 
         let message = request.into_inner();
 
         info!("received new grpc submit tx request: {:?}", message);
 
-        let query_service =
-            QueryServiceImpl::new(self.ledger.clone(), Arc::clone(&self.genesis_files));
+        let curr_point = match self.ledger.cursor()? {
+            Some(point) => point,
+            None => return Err(Status::internal("Uninitialized ledger.")),
+        };
 
-        let params = query_service
-            .read_params(tonic::Request::new(ReadParamsRequest {
-                field_mask: Default::default(),
-            }))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_inner()
-            .values
-            .ok_or_else(|| Status::internal("Could not retrieve protocol parameters."))?
-            .params
-            .ok_or_else(|| Status::internal("Could not retrieve protocol parameters."))?;
-
+        let updates = self.ledger.get_pparams(curr_point.0)?;
+        let updates: Vec<_> = updates
+            .iter()
+            .map(|PParamsBody(era, cbor)| -> Result<MultiEraUpdate, Status> {
+                MultiEraUpdate::decode_for_era(*era, cbor)
+                    .map_err(|e| Status::internal(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let network_magic = self
             .genesis_files
             .2
             .network_magic
             .ok_or_else(|| Status::internal("networkMagic missing in shelley genesis."))?
             .into();
+
+        let genesis = Genesis {
+            alonzo: &self.genesis_files.0,
+            byron: &self.genesis_files.1,
+            shelley: &self.genesis_files.2,
+            conway: &self.genesis_files.3,
+        };
 
         let genesis_values = GenesisValues::from_magic(network_magic)
             .ok_or_else(|| Status::internal("Could not retrieve genesis values."))?;
@@ -171,7 +179,16 @@ impl submit_service_server::SubmitService for SubmitServiceImpl {
             zero_slot: genesis_values.shelley_known_slot,
             zero_time: genesis_values.shelley_known_time,
         };
-
+        let (epoch, _) = genesis_values.absolute_slot_to_relative(curr_point.0);
+        let params = pparams::fold_pparams(&genesis, &updates, epoch);
+        let env = Environment {
+            prot_params: params.clone(),
+            prot_magic: network_magic as u32,
+            block_slot: curr_point.0,
+            network_id: genesis_values.network_id as u8,
+            acnt: Some(AccountState::default()),
+        };
+        
         let mut hashes = vec![];
         for (idx, tx_bytes) in message.tx.into_iter().flat_map(|x| x.r#type).enumerate() {
             match tx_bytes {
@@ -179,7 +196,7 @@ impl submit_service_server::SubmitService for SubmitServiceImpl {
                     let utxos = resolve_inputs(&self.ledger, bytes.as_ref()).unwrap();
                     let hash = self
                         .mempool
-                        .receive_raw(bytes.as_ref(), &utxos, &params, &slot_config)
+                        .receive_raw(bytes.as_ref(), &utxos, &params, &slot_config, &env)
                         .map_err(|e| {
                             Status::invalid_argument(
                                 format! {"could not process tx at index {idx}: {e}"},
@@ -254,7 +271,7 @@ impl submit_service_server::SubmitService for SubmitServiceImpl {
         fn do_eval_tx(
             ledger: &LedgerStore,
             tx_cbor: &[u8],
-            params: &Params,
+            _params: &Params,
             slot_config: &SlotConfig,
         ) -> Result<Vec<Redeemer>, Status> {
             let minted_tx: MintedTx = minicbor::decode(tx_cbor).unwrap();
@@ -293,7 +310,7 @@ impl submit_service_server::SubmitService for SubmitServiceImpl {
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
 
-            eval_tx(&minted_tx, params, &resolved_inputs, slot_config)
+            eval_tx(&minted_tx, &resolved_inputs, slot_config)
                 .map_err(|e| Status::internal(e.to_string()))
         }
 

@@ -1,5 +1,8 @@
+use crate::ledger::{EraCbor, TxoRef};
+
 use super::{error::Error, to_plutus_data::MintValue};
 use itertools::Itertools;
+use pallas::codec::minicbor;
 use pallas::codec::utils::{
     Bytes, KeyValuePairs, NonEmptyKeyValuePairs, NonEmptySet, Nullable, PositiveCoin,
 };
@@ -1149,4 +1152,22 @@ pub fn sort_reward_accounts(a: &Bytes, b: &Bytes) -> Ordering {
     } else {
         unreachable!("invalid reward address in withdrawals.");
     }
+}
+
+pub fn utxo_to_resolved_inputs(utxos: HashMap<TxoRef, EraCbor>) -> Vec<ResolvedInput> {
+    let resolved_inputs = utxos
+                .into_iter()
+                .map(|(txo_ref, utxo_cbor)| {
+                    let output = minicbor::decode(&utxo_cbor.1).unwrap();
+                    ResolvedInput {
+                        input: TransactionInput {
+                            transaction_id: txo_ref.0,
+                            index: txo_ref.1.into(),
+                        },
+                        output,
+                    }
+                })
+                .collect();
+    
+    resolved_inputs
 }

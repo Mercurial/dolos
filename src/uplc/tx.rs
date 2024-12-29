@@ -12,13 +12,10 @@ use super::{
     },
     to_plutus_data::convert_tag_to_constr,
 };
-use pallas::{
-    interop::utxorpc::spec::query::any_chain_params::Params,
-    ledger::primitives::{
+use pallas::ledger::primitives::{
         conway::{MintedTx, Redeemer, Redeemers, RedeemersKey, RedeemersValue},
         PlutusData,
-    },
-};
+    };
 use rug::Integer;
 use uplc::{
     binder::DeBruijn,
@@ -110,12 +107,17 @@ pub fn plutus_data_to_pragma_term(arena: &Bump, data: PlutusData) -> &Term<'_, D
 
 pub fn eval_tx(
     tx: &MintedTx,
-    _protocol_params: &Params, // For Cost Models
+    // protocol_params: &MultiEraProtocolParameters, // For Cost Models
     utxos: &[ResolvedInput],
     slot_config: &SlotConfig,
 ) -> Result<Vec<Redeemer>, Error> {
     let lookup_table = DataLookupTable::from_transaction(tx, utxos);
+    let redeemer_is_empty = tx.transaction_witness_set.redeemer.is_none();
 
+    if redeemer_is_empty {
+        return Ok(vec![]);
+    }
+    
     let redeemers = tx
         .transaction_witness_set
         .redeemer
@@ -184,7 +186,6 @@ pub fn eval_redeemer(
         let script_context = tx_info
             .into_script_context(redeemer, datum.as_ref())
             .ok_or_else(|| Error::ScriptContextBuildError)?;
-
         let arena = Bump::with_capacity(1_024_000);
         let script_context_term =
             plutus_data_to_pragma_term(&arena, script_context.to_plutus_data());
@@ -200,9 +201,11 @@ pub fn eval_redeemer(
             .apply(&arena, redeemer_term)
             .apply(&arena, script_context_term),
 
-            ScriptContext::V3 { .. } => program.apply(&arena, script_context_term),
+            ScriptContext::V3 { .. } => {
+                program.apply(&arena, script_context_term)
+            }
         };
-
+        
         let result = program.eval(&arena);
 
         Ok(TxEvalResult {

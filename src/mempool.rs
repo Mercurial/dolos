@@ -1,21 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    borrow::Cow, collections::{HashMap, HashSet}, sync::{Arc, RwLock}
 };
-use crate::uplc::{
-    script_context::{ResolvedInput, SlotConfig},
-    tx,
-};
+use crate::{ledger::{EraCbor, TxoRef}, uplc::{script_context::{utxo_to_resolved_inputs, SlotConfig}, tx}};
 use futures_util::StreamExt;
 use itertools::Itertools;
 use pallas::{
-    codec::minicbor,
-    crypto::hash::Hash,
-    interop::utxorpc::spec::query::any_chain_params::Params,
-    ledger::{
-        primitives::conway::MintedTx,
-        traverse::{MultiEraBlock, MultiEraTx},
-    },
+    applying::{validate_tx, CertState, Environment, MultiEraProtocolParameters, UTxOs},crypto::hash::Hash,ledger::{
+        primitives::TransactionInput,
+        traverse::{MultiEraBlock, MultiEraInput, MultiEraOutput, MultiEraTx},
+    }
 };
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -34,6 +27,7 @@ pub enum MempoolError {
 
     #[error("invalid tx: {0}")]
     InvalidTx(String),
+
 }
 
 impl From<pallas::ledger::traverse::Error> for MempoolError {
@@ -121,20 +115,34 @@ impl Mempool {
     pub fn receive_raw(
         &self,
         cbor: &[u8],
-        utxos: &[ResolvedInput],
-        protocol_params: &Params,
+        utxos: &HashMap<TxoRef, EraCbor>,
+        _protocol_params: &MultiEraProtocolParameters,
         slot_config: &SlotConfig,
+        env: &Environment
     ) -> Result<TxHash, MempoolError> {
         let decoded = MultiEraTx::decode(cbor)?;
-        let minted_tx: MintedTx = minicbor::decode(cbor).unwrap();
         let hash = decoded.hash();
-        
-        if utxos.len() > 0 {
-            let eval_tx = tx::eval_tx(&minted_tx, protocol_params, &utxos, slot_config).is_ok();
-            
-            if !eval_tx {
-                return Err(MempoolError::EvaluationError);
-            }
+        let mut cert_state = CertState::default();
+        let mut multi_era_utxos = UTxOs::new();
+        for (txo_ref, era_cbor) in utxos {
+            let transaction_input = TransactionInput {
+                transaction_id: txo_ref.0,
+                index: txo_ref.1.into(),
+            };
+            let multi_era_input = MultiEraInput::AlonzoCompatible(<Box<Cow<'_,TransactionInput>>>::from(Cow::Owned(transaction_input)));
+            let multi_era_output = MultiEraOutput::try_from(era_cbor).unwrap();
+            multi_era_utxos.insert(multi_era_input, multi_era_output);
+        }
+
+        let is_valid = validate_tx(&decoded, 0, env, &multi_era_utxos, &mut cert_state).is_ok();
+        if !is_valid {
+            return Err(MempoolError::InvalidTx("".to_owned()));
+        }
+
+        let resolved_inputs = utxo_to_resolved_inputs(utxos.clone());
+        let eval_tx = tx::eval_tx(&decoded.as_conway().unwrap(),  &resolved_inputs, slot_config).is_ok();
+        if !eval_tx {
+            return Err(MempoolError::EvaluationError);
         }
 
         let tx = Tx {
